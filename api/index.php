@@ -77,7 +77,7 @@ function validate_auth_cookie($cookie_val) {
 // ==================== 读取环境变量 ====================
 
 $target_ip     = getenv('TARGET_IP');
-$target_port   = getenv('TARGET_PORT') ?: '80';
+$target_port   = getenv('TARGET_PORT');
 $target_scheme = getenv('TARGET_SCHEME') ?: 'http';
 $auth_passwd   = getenv('AUTH_PASSWD');
 $auth_totp     = getenv('AUTH_TOTP_SECRET');
@@ -211,7 +211,7 @@ $clean_uri = $path . $query;
 
 // 构建目标 URL
 $redirect_url = $target_scheme . '://' . $target_ip;
-if ($target_port !== '80' && $target_port !== '443') {
+if (!empty($target_port) && $target_port !== '80' && $target_port !== '443') {
     $redirect_url .= ':' . $target_port;
 }
 $redirect_url .= $clean_uri;
