@@ -4,11 +4,18 @@
  * 
  * 环境变量：
  *   TARGET_IP        - 目标服务器 IP（必填）
- *   TARGET_PORT      - 目标端口（默认 80）
+ *   TARGET_PORT      - 默认端口（可选，查询参数 p/port/裸数字 优先级更高）
  *   TARGET_SCHEME    - 目标协议（默认 http）
  *   AUTH_PASSWD      - 第一关：密码（必填）
  *   AUTH_TOTP_SECRET - 第二关：TOTP 密钥 Base32（必填，SHA1 30s）
  *   AUTH_SALT        - Cookie 签名盐值（可选，默认自动生成）
+ * 
+ * 端口指定方式（优先级从高到低）：
+ *   1. ?p=8088
+ *   2. ?port=8088
+ *   3. ?8088（裸数字）
+ *   4. TARGET_PORT 环境变量
+ *   5. 不指定（走默认 80）
  */
 
 // ==================== TOTP 工具函数 ====================
@@ -49,7 +56,6 @@ function generate_totp($secret, $period = 30) {
 function get_auth_salt() {
     $salt = getenv('AUTH_SALT');
     if (empty($salt)) {
-        // 用 TOTP 密钥的一部分作为默认盐值
         $salt = substr(getenv('AUTH_TOTP_SECRET') ?: '', 0, 16);
     }
     return $salt ?: 'default-salt-change-me-2024';
@@ -67,17 +73,52 @@ function validate_auth_cookie($cookie_val) {
     $parts = explode('.', $cookie_val);
     if (count($parts) !== 3) return false;
     [$token, $ts, $sig] = $parts;
-    // 检查 7 天有效期
     if (time() - intval($ts) > 7 * 86400) return false;
     $salt = get_auth_salt();
     $expected_sig = hash_hmac('sha256', "$token.$ts", $salt);
     return hash_equals($expected_sig, $sig);
 }
 
+// ==================== 端口提取工具 ====================
+
+/**
+ * 从查询字符串中提取端口号（排除 auth_step/redirect 参数干扰）
+ * 支持：?p=8088、?port=8088、?8088（裸数字）
+ */
+function extract_port_from_query($query_string) {
+    if (empty($query_string)) return null;
+
+    $parts = explode('&', $query_string);
+    $bare_numbers = [];
+
+    foreach ($parts as $part) {
+        $part = trim($part);
+        if (empty($part)) continue;
+
+        // 跳过认证参数
+        if (strpos($part, 'auth_step=') === 0 || strpos($part, 'redirect=') === 0) continue;
+
+        if (strpos($part, '=') !== false) {
+            [$key, $value] = explode('=', $part, 2);
+            $key = urldecode($key);
+            $value = urldecode($value);
+            if (($key === 'p' || $key === 'port') && is_numeric($value)) {
+                return intval($value);
+            }
+        } else {
+            // 裸数字：?8088
+            if (is_numeric($part)) {
+                $bare_numbers[] = intval($part);
+            }
+        }
+    }
+
+    return !empty($bare_numbers) ? $bare_numbers[0] : null;
+}
+
 // ==================== 读取环境变量 ====================
 
 $target_ip     = getenv('TARGET_IP');
-$target_port   = getenv('TARGET_PORT');
 $target_scheme = getenv('TARGET_SCHEME') ?: 'http';
 $auth_passwd   = getenv('AUTH_PASSWD');
 $auth_totp     = getenv('AUTH_TOTP_SECRET');
@@ -96,6 +137,22 @@ if (empty($auth_totp)) {
     exit('Error: AUTH_TOTP_SECRET environment variable is not set.');
 }
 
+// ==================== 端口检测 ====================
+
+// 1) 优先从当前查询字符串提取
+$target_port = extract_port_from_query($_SERVER['QUERY_STRING'] ?? '');
+// 2) 在认证流程中，从 redirect 参数里的原始 URL 提取
+if (empty($target_port) && isset($_GET['redirect'])) {
+    $redirect_parts = parse_url($_GET['redirect']);
+    if (isset($redirect_parts['query'])) {
+        $target_port = extract_port_from_query($redirect_parts['query']);
+    }
+}
+// 3) 最后回退到环境变量
+if (empty($target_port)) {
+    $target_port = getenv('TARGET_PORT');
+}
+
 // ==================== 认证检查 ====================
 
 $auth_cookie  = $_COOKIE['auth_token'] ?? '';
@@ -106,7 +163,7 @@ if (!$is_verified) {
     $orig_uri = $_SERVER['REQUEST_URI'] ?? '/';
     // 如果已经在 auth 流程中，从参数取 redirect
     $redirect_to = $_GET['redirect'] ?? $orig_uri;
-    // 如果 redirect 里也带了 auth_step，清理掉
+    // 清理掉 redirect 里残留的 auth_step/auth 参数
     $redirect_to = preg_replace('/[?&]auth_step=[^&]*/', '', $redirect_to);
     $redirect_to = preg_replace('/[?&]redirect=[^&]*/', '', $redirect_to);
     $redirect_to = rtrim($redirect_to, '?&') ?: '/';
@@ -117,7 +174,6 @@ if (!$is_verified) {
     // ---- Step 1: 密码验证 ----
     if ($step === 'password' && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
         if (hash_equals($auth_passwd, $_POST['password'])) {
-            // 密码正确 -> 跳转到 TOTP 页
             $goto = '?auth_step=totp&redirect=' . urlencode($redirect_to);
             header('Location: ' . $goto, true, 302);
             exit();
@@ -130,7 +186,6 @@ if (!$is_verified) {
     if ($step === 'totp' && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['totp'])) {
         $expected_totp = generate_totp($auth_totp);
         if (hash_equals($expected_totp, $_POST['totp'])) {
-            // TOTP 正确 -> 设置 7 天有效 Cookie
             $cookie_val = build_auth_cookie();
             setcookie('auth_token', $cookie_val, time() + 7 * 86400, '/', '', true, true);
             header('Location: ' . $redirect_to, true, 302);
@@ -197,17 +252,29 @@ body{display:flex;justify-content:center;align-items:center;min-height:100vh;bac
 
 $request_uri = $_SERVER['REQUEST_URI'] ?? '/';
 
-// 清理 URI 中的认证参数
-$parsed = parse_url($request_uri);
-$path   = $parsed['path'] ?? '/';
-if (isset($parsed['query'])) {
-    parse_str($parsed['query'], $params);
-    unset($params['auth_step'], $params['redirect']);
-    $query = $params ? '?' . http_build_query($params) : '';
-} else {
-    $query = '';
+// 手动清理 URI：移除 auth 参数和端口参数，保留其他
+$uri_parts = explode('?', $request_uri, 2);
+$path       = $uri_parts[0];
+$query_parts = isset($uri_parts[1]) ? explode('&', $uri_parts[1]) : [];
+$clean_parts = [];
+
+foreach ($query_parts as $part) {
+    $part = trim($part);
+    if (empty($part)) continue;
+    // 跳过认证参数
+    if (strpos($part, 'auth_step=') === 0 || strpos($part, 'redirect=') === 0) continue;
+    // 跳过端口参数
+    if (strpos($part, '=') !== false) {
+        [$key] = explode('=', $part, 2);
+        $key = urldecode($key);
+        if ($key === 'p' || $key === 'port') continue;
+    } elseif (is_numeric($part)) {
+        continue; // 裸数字端口
+    }
+    $clean_parts[] = $part;
 }
-$clean_uri = $path . $query;
+
+$clean_uri = $path . (!empty($clean_parts) ? '?' . implode('&', $clean_parts) : '');
 
 // 构建目标 URL
 $redirect_url = $target_scheme . '://' . $target_ip;
